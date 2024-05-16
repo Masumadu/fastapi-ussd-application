@@ -1,0 +1,128 @@
+# This is a basic workflow for nova project
+
+name: Build and Push to Docker Registry
+
+# Controls when the action will run.
+on:
+  # Triggers the workflow on push or pull request events but only for the develop branch
+  push:
+    branches: [ develop ]
+  pull_request:
+    branches: [ develop ]
+
+  # Allows you to run this workflow manually from the Actions tab
+  workflow_dispatch:
+
+# A workflow run is made up of one or more jobs that can run sequentially or in parallel
+jobs:
+ # This workflow contains a two jobs called "build", "docker"
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: [ "3.10.10" ]
+        poetry-version: [ "1.4.2" ]
+    # The type of runner that the job will run on
+    runs-on: self-hosted
+    timeout-minutes: 20
+    env:
+      APP_CONFIG: testing
+      TEST_DB_NAME: testdb
+      TEST_DB_HOST: localhost
+      TEST_DB_PORT: 5430
+      TEST_DB_USER: postgres
+      TEST_DB_PASSWORD: postgres
+
+    # spin up docker container
+    services:
+      # Label used to access the docker container
+      postgres:
+        # Docker Hub image
+        image: postgres
+        env:
+          POSTGRES_USER: ${{ env.TEST_B_USER }}
+          POSTGRES_PASSWORD: ${{ env.TEST_DB_PASSWORD }}
+          POSTGRES_DB: ${{ env.TEST_DB_NAME }}
+        ports:
+          - 5430:5432
+        # Set health checks to wait until postgres has started
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    # Steps represent a sequence of tasks that will be executed as part of the job
+    steps:
+      - name: Checkout of the repository
+        uses: actions/checkout@v3
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v4
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install Poetry
+        uses: snok/install-poetry@v1
+        with:
+          version: ${{ matrix.poetry-version }}
+
+      - name: View poetry --help
+        run: poetry --help
+
+      - name: View file structure
+        run: ls -la
+
+      - name: Install dependencies
+        shell: bash
+        run: poetry install --no-root
+
+      - name: Test migration scripts
+        shell: bash
+        run: |
+          poetry run python -m alembic upgrade head
+
+  docker:
+    needs: build
+    runs-on: self-hosted
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v2
+
+      - name: Docker meta
+        id: docker_meta
+        uses: docker/metadata-action@v3
+        with:
+          images: registry.digitalocean.com/masumadu-private-registry/fastapi-ussd-backend-v2
+          tags: |
+            type=ref,event=branch
+            type=sha,prefix={{branch}}
+
+      - name: Login to Docker
+        uses: docker/login-action@v1
+        with:
+          registry: ${{ secrets.DOCKER_URL }}
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+
+      - name: Setup Docker Buildx
+        uses: docker/setup-buildx-action@v1
+
+      - name: build and Push image
+        uses: docker/build-push-action@v2
+        with:
+          push: true
+          tags: ${{ steps.docker_meta.outputs.tags }}
+          file: ./Dockerfile
+
+  update-deployment:
+    if: github.ref == 'refs/heads/develop' # Run only for the develop branch
+    needs: docker
+    runs-on: self-hosted
+    timeout-minutes: 10
+    steps:
+    - uses: tale/kubectl-action@v1
+      with:
+        base64-kube-config: ${{ secrets.KUBE_CONFIG }}
+    - run: kubectl delete pod -n new-nova-gas -l app=fastapi-ussd-backend --force
